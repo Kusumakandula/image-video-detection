@@ -1,151 +1,149 @@
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+import cv2
+import os
+import sqlite3
+from PIL import Image
+import numpy as np
+from datetime import datetime
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+# Database Setup
+DB_FILE = "predictions.db"
+conn = sqlite3.connect(DB_FILE)
+cursor = conn.cursor()
+
+# Create the predictions table if it doesn't exist
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_name TEXT,
+    prediction TEXT,
+    timestamp TEXT
 )
+""")
+conn.commit()
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Function to save predictions to the database
+def save_to_database(file_name, prediction):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("INSERT INTO predictions (file_name, prediction, timestamp) VALUES (?, ?, ?)",
+                   (file_name, prediction, timestamp))
+    conn.commit()
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# Function to query predictions from the database
+def query_predictions():
+    cursor.execute("SELECT * FROM predictions")
+    rows = cursor.fetchall()
+    return rows
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# Function for object detection in images
+def detect_objects_in_image(image):
+    """Performs object detection on the input image."""
+    # Convert image to OpenCV format and grayscale
+    gray_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+    # Load Haar Cascade for face detection
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = face_cascade.detectMultiScale(gray_image, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+    # Draw rectangles around detected faces
+    for (x, y, w, h) in faces:
+        cv2.rectangle(gray_image, (x, y), (x + w, y + h), (255, 255, 255), 2)
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+    prediction = f"Detected {len(faces)} face(s)."
+    return gray_image, prediction
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+# Function for object detection in all frames of a video
+def detect_objects_in_video(video_path):
+    """Performs object detection on all frames of a video."""
+    cap = cv2.VideoCapture(video_path)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
 
-    return gdp_df
+    # Create a VideoWriter to save the processed video
+    processed_video_path = os.path.join("results", f"processed_{os.path.basename(video_path)}")
+    os.makedirs("results", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use MP4 codec
+    out = cv2.VideoWriter(processed_video_path, fourcc, fps, (frame_width, frame_height), isColor=False)
 
-gdp_df = get_gdp_data()
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    face_count = 0
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+        # Convert the frame to grayscale
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+        # Detect faces in the frame
+        faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
-# Add some spacing
-''
-''
+        # Draw rectangles around detected faces
+        for (x, y, w, h) in faces:
+            cv2.rectangle(gray_frame, (x, y), (x + w, y + h), (255, 255, 255), 2)
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+        face_count += len(faces)
+        out.write(gray_frame)
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+    cap.release()
+    out.release()
 
-countries = gdp_df['Country Code'].unique()
+    prediction = f"Processed video. Detected a total of {face_count} face(s)."
+    return processed_video_path, prediction
 
-if not len(countries):
-    st.warning("Select at least one country")
+# Function to display saved predictions
+def display_predictions():
+    st.header("Saved Predictions")
+    results = query_predictions()
+    if results:
+        for row in results:
+            st.write(f"ID: {row[0]}, File: {row[1]}, Prediction: {row[2]}, Timestamp: {row[3]}")
+    else:
+        st.write("No predictions found.")
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+# Main Streamlit App
+def main():
+    st.title("Image/Video Detection")
 
-''
-''
-''
+    # Image Upload Section
+    uploaded_image = st.file_uploader("Upload an Image", type=["jpg", "jpeg", "png"])
+    if uploaded_image is not None:
+        image = Image.open(uploaded_image)
+        st.image(image, caption="Uploaded Image", use_column_width=True)
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+        if st.button("Start Prediction (Image)"):
+            processed_image, prediction = detect_objects_in_image(image)
+            st.image(processed_image, caption="Processed Image", use_column_width=True, channels="GRAY")
+            st.success(f"Prediction: {prediction}")
 
-st.header('GDP over time', divider='gray')
+            # Save results
+            file_name = uploaded_image.name
+            save_to_database(file_name, prediction)
+            result_path = os.path.join("results", file_name)
+            os.makedirs("results", exist_ok=True)
+            cv2.imwrite(result_path, processed_image)
 
-''
+    # Video Upload Section
+    uploaded_video = st.file_uploader("Upload a Video", type=["mp4", "avi"])
+    if uploaded_video is not None:
+        video_path = os.path.join("temp_videos", uploaded_video.name)
+        os.makedirs("temp_videos", exist_ok=True)
+        with open(video_path, "wb") as f:
+            f.write(uploaded_video.read())
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
+        if st.button("Start Prediction (Video)"):
+            processed_video_path, prediction = detect_objects_in_video(video_path)
+            st.video(processed_video_path)
+            st.success(f"Prediction: {prediction}")
 
-''
-''
+            # Save results
+            save_to_database(uploaded_video.name, prediction)
 
+    # Show Saved Predictions
+    if st.button("Saved Predictions"):
+        display_predictions()
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+if __name__ == "__main__":
+    main()
